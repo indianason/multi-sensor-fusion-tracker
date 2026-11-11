@@ -10,21 +10,25 @@ use axum::{
 };
 use std::net::SocketAddr;
 use tokio::sync::broadcast;
-use tracing::info;
+use tower_http::trace::TraceLayer;
+use tracing::{error, info, warn};
 
 #[derive(Clone)]
 struct AppState {
-    snapshot_tx: broadcast::Sender<Vec<Track>>,
+    // Wrapped in Arc to prevent N deep clones per frame
+    snapshot_tx: broadcast::Sender<Arc<Vec<Track>>>,
 }
 
 /// Serve the live dashboard: a single HTML page over HTTP plus a
 /// WebSocket endpoint that streams track snapshots as they're broadcast
 /// from the fusion loop in main.rs.
-pub async fn run_dashboard_server(snapshot_tx: broadcast::Sender<Vec<Track>>, addr: SocketAddr) {
+pub async fn run_dashboard_server(snapshot_tx: broadcast::Sender<Arc<Vec<Track>>>, addr: SocketAddr) {
     let state = AppState { snapshot_tx };
     let app = Router::new()
         .route("/", get(serve_dashboard))
         .route("/ws", get(ws_handler))
+        // Added TraceLayer for structured HTTP/WS observability
+        .layer(TraceLayer::new_for_http())
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -45,16 +49,23 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
     ws.on_upgrade(move |socket| handle_socket(socket, rx))
 }
 
-async fn handle_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Vec<Track>>) {
+async fn handle_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Arc<Vec<Track>>>) {
+    info!("Client connected to websocket");
     loop {
         match rx.recv().await {
             Ok(tracks) => {
+                // tracks is now an Arc<Vec<Track>>, keeping memory usage flat
                 let payload = match serde_json::to_string(&tracks) {
                     Ok(json) => json,
-                    Err(_) => continue,
+                    Err(_) => {
+                        // Log serialization errors instead of silently swallowing
+                        error!(error = %e, "Failed to serialize tracks to JSON");
+                        continue,
+                    }
                 };
                 if socket.send(Message::Text(payload.into())).await.is_err() {
                     // Client disconnected (closed tab, network drop, etc).
+                    info!("Client disconnected normally");
                     break;
                 }
             }
@@ -62,9 +73,13 @@ async fn handle_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Vec<Tr
                 // A slow client skips ahead to the latest snapshot rather
                 // than the connection dying or backing up the channel —
                 // "current state" matters more than "every frame" here.
+                warn!(skipped_frames = skipped, "Client is lagging, skipped frames");
                 continue;
             }
-            Err(broadcast::error::RecvError::Closed) => break,
+            Err(broadcast::error::RecvError::Closed) => {
+                info!("Broadcast channel closed, terminating socket");
+                break,
+            }
         }
     }
 }
