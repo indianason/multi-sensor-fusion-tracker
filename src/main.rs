@@ -6,7 +6,8 @@ mod world;
 
 use chrono::Utc;
 use fusion::FusionEngine;
-use std::net::SocketAddr;
+use types::Track;
+use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{interval, Duration};
 use tracing::{info, warn};
@@ -41,7 +42,8 @@ async fn main() {
     // since subscribers are expected to keep up with a ~10Hz feed; a
     // lagging client skips ahead (see dashboard.rs) rather than the
     // tracker itself being slowed down by a slow consumer.
-    let (snapshot_tx, _) = broadcast::channel(16);
+    // Broadcast channel now uses Arc<Vec<Track>> to prevent N deep clones per client.
+    let (snapshot_tx, _) = broadcast::channel::<Arc<Vec<Track>>>(16);
     let dashboard_addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
     tokio::spawn(dashboard::run_dashboard_server(
         snapshot_tx.clone(),
@@ -80,7 +82,10 @@ async fn main() {
                 engine.sweep(Utc::now());
                 // Ignore send errors: "no dashboard client connected yet"
                 // is the normal case, not a failure condition.
-                let _ = snapshot_tx.send(engine.tracks().cloned().collect());
+                // Deep-clone the tracks exactly once, move them into immutable Arc slice.
+                // Every connected dashboard client receives a pointer to this single allocation.
+                let snapshot: Arc<Vec<Track>> = engine.tracks().cloned().collect::<Vec<_>>().into();
+                let _ = snapshot_tx.send(snapshot);
             }
         }
     }
